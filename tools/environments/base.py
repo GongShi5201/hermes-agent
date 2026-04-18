@@ -23,6 +23,12 @@ from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
+# Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
+# HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
+# every is_interrupted() state change from _wait_for_process.  Off by default
+# to avoid flooding production gateway logs.
+_DEBUG_INTERRUPT = bool(os.getenv("HERMES_DEBUG_INTERRUPT"))
+
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
@@ -437,8 +443,34 @@ class BaseEnvironment(ABC):
             "start": _now,
         }
 
+        # --- Debug tracing (opt-in via HERMES_DEBUG_INTERRUPT=1) -------------
+        # Captures loop entry/exit, interrupt state changes, and periodic
+        # heartbeats so we can diagnose "agent never sees the interrupt"
+        # reports without reproducing locally.
+        _tid = threading.current_thread().ident
+        _pid = getattr(proc, "pid", None)
+        _iter_count = 0
+        _last_heartbeat = _now
+        _last_interrupt_state = False
+        _cb_was_none = _get_activity_callback() is None
+        if _DEBUG_INTERRUPT:
+            logger.info(
+                "[interrupt-debug] _wait_for_process ENTER tid=%s pid=%s "
+                "timeout=%ss activity_cb=%s initial_interrupt=%s",
+                _tid, _pid, timeout,
+                "set" if not _cb_was_none else "MISSING",
+                is_interrupted(),
+            )
+
         while proc.poll() is None:
+            _iter_count += 1
             if is_interrupted():
+                if _DEBUG_INTERRUPT:
+                    logger.info(
+                        "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
+                        "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
+                        _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
+                    )
                 self._kill_process(proc)
                 drain_thread.join(timeout=2)
                 return {
@@ -446,6 +478,12 @@ class BaseEnvironment(ABC):
                     "returncode": 130,
                 }
             if time.monotonic() > deadline:
+                if _DEBUG_INTERRUPT:
+                    logger.info(
+                        "[interrupt-debug] _wait_for_process TIMEOUT "
+                        "tid=%s pid=%s iter=%d timeout=%ss",
+                        _tid, _pid, _iter_count, timeout,
+                    )
                 self._kill_process(proc)
                 drain_thread.join(timeout=2)
                 partial = "".join(output_chunks)
@@ -458,6 +496,25 @@ class BaseEnvironment(ABC):
                 }
             # Periodic activity touch so the gateway knows we're alive
             touch_activity_if_due(_activity_state, "terminal command running")
+
+            # Heartbeat every ~30s: proves the loop is alive and reports
+            # the activity-callback state (thread-local, can get clobbered
+            # by nested tool calls or executor thread reuse).
+            if _DEBUG_INTERRUPT and time.monotonic() - _last_heartbeat >= 30.0:
+                _cb_now_none = _get_activity_callback() is None
+                logger.info(
+                    "[interrupt-debug] _wait_for_process HEARTBEAT "
+                    "tid=%s pid=%s iter=%d elapsed=%.0fs "
+                    "interrupt=%s activity_cb=%s%s",
+                    _tid, _pid, _iter_count,
+                    time.monotonic() - _activity_state["start"],
+                    is_interrupted(),
+                    "set" if not _cb_now_none else "MISSING",
+                    " (LOST during run)" if _cb_now_none and not _cb_was_none else "",
+                )
+                _last_heartbeat = time.monotonic()
+                _cb_was_none = _cb_now_none
+
             time.sleep(0.2)
 
         drain_thread.join(timeout=5)
@@ -466,6 +523,15 @@ class BaseEnvironment(ABC):
             proc.stdout.close()
         except Exception:
             pass
+
+        if _DEBUG_INTERRUPT:
+            logger.info(
+                "[interrupt-debug] _wait_for_process EXIT (natural) "
+                "tid=%s pid=%s iter=%d elapsed=%.1fs returncode=%s",
+                _tid, _pid, _iter_count,
+                time.monotonic() - _activity_state["start"],
+                proc.returncode,
+            )
 
         return {"output": "".join(output_chunks), "returncode": proc.returncode}
 

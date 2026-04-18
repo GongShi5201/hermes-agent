@@ -14,7 +14,17 @@ Usage in tools:
         return {"output": "[interrupted]", "returncode": 130}
 """
 
+import logging
+import os
 import threading
+
+logger = logging.getLogger(__name__)
+
+# Opt-in debug tracing — pairs with HERMES_DEBUG_INTERRUPT in
+# tools/environments/base.py.  Enables per-call logging of set/check so the
+# caller thread, target thread, and current state are visible when
+# diagnosing "interrupt signaled but tool never saw it" reports.
+_DEBUG_INTERRUPT = bool(os.getenv("HERMES_DEBUG_INTERRUPT"))
 
 # Set of thread idents that have been interrupted.
 _interrupted_threads: set[int] = set()
@@ -35,6 +45,13 @@ def set_interrupt(active: bool, thread_id: int | None = None) -> None:
             _interrupted_threads.add(tid)
         else:
             _interrupted_threads.discard(tid)
+        _snapshot = set(_interrupted_threads) if _DEBUG_INTERRUPT else None
+    if _DEBUG_INTERRUPT:
+        logger.info(
+            "[interrupt-debug] set_interrupt(active=%s, target_tid=%s) "
+            "called_from_tid=%s current_set=%s",
+            active, tid, threading.current_thread().ident, _snapshot,
+        )
 
 
 def is_interrupted() -> bool:
