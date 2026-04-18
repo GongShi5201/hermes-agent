@@ -2,19 +2,18 @@
 """
 Memory Tool Module - Persistent Curated Memory
 
-Provides bounded, file-backed memory that persists across sessions. Two stores:
+Provides bounded, file-backed memory that persists across sessions. Three stores:
   - MEMORY.md: agent's personal notes and observations (environment facts, project
     conventions, tool quirks, things learned)
   - USER.md: what the agent knows about the user (preferences, communication style,
     expectations, workflow habits)
+  - SOUL.md: agent's persona and behavior rules (evolves with usage)
 
-Both are injected into the system prompt as a frozen snapshot at session start.
+MEMORY.md and USER.md use § as entry delimiter. SOUL.md is treated as a whole file.
+All are injected into the system prompt as a frozen snapshot at session start.
 Mid-session writes update files on disk immediately (durable) but do NOT change
 the system prompt -- this preserves the prefix cache for the entire session.
 The snapshot refreshes on the next session start.
-
-Entry delimiter: § (section sign). Entries can be multiline.
-Character limits (not tokens) because char counts are model-independent.
 
 Design:
 - Single `memory` tool with action parameter: add, replace, remove, read
@@ -76,8 +75,8 @@ _MEMORY_THREAT_PATTERNS = [
     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets"),
     # Persistence via shell rc
     (r'authorized_keys', "ssh_backdoor"),
-    (r'\$HOME/\.ssh|\~/\.ssh', "ssh_access"),
-    (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env"),
+    (r'\$HOME/\.ssh|~/\.ssh', "ssh_access"),
+    (r'\$HOME/\.hermes/\.env|~/\.hermes/\.env', "hermes_env"),
 ]
 
 # Subset of invisible chars for injection detection
@@ -111,23 +110,28 @@ class MemoryStore:
         Never mutated mid-session. Keeps prefix cache stable.
       - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
         Tool responses always reflect this live state.
+      - soul_content: SOUL.md content (whole file, not entries).
     """
+
+    SOUL_CHAR_LIMIT = 10000  # 10KB limit for SOUL.md
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        self.soul_content: str = ""
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "soul": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from MEMORY.md, USER.md, and SOUL.md, capture system prompt snapshot."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.soul_content = self._read_soul_file(mem_dir / "SOUL.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -137,6 +141,7 @@ class MemoryStore:
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", self.memory_entries),
             "user": self._render_block("user", self.user_entries),
+            "soul": self._render_soul_block(self.soul_content),
         }
 
     @staticmethod
@@ -181,6 +186,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
+        elif target == "soul":
+            return mem_dir / "SOUL.md"
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str):
@@ -188,14 +195,20 @@ class MemoryStore:
 
         Called under file lock to get the latest state before mutating.
         """
-        fresh = self._read_file(self._path_for(target))
-        fresh = list(dict.fromkeys(fresh))  # deduplicate
-        self._set_entries(target, fresh)
+        if target == "soul":
+            self.soul_content = self._read_soul_file(self._path_for(target))
+        else:
+            fresh = self._read_file(self._path_for(target))
+            fresh = list(dict.fromkeys(fresh))  # deduplicate
+            self._set_entries(target, fresh)
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        if target == "soul":
+            self._write_soul_file(self._path_for(target), self.soul_content)
+        else:
+            self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -209,6 +222,8 @@ class MemoryStore:
             self.memory_entries = entries
 
     def _char_count(self, target: str) -> int:
+        if target == "soul":
+            return len(self.soul_content)
         entries = self._entries_for(target)
         if not entries:
             return 0
@@ -217,6 +232,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        elif target == "soul":
+            return self.SOUL_CHAR_LIMIT
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -229,6 +246,10 @@ class MemoryStore:
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        # Handle SOUL.md differently (append to whole file)
+        if target == "soul":
+            return self._add_to_soul(content)
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions
@@ -264,6 +285,35 @@ class MemoryStore:
 
         return self._success_response(target, "Entry added.")
 
+    def _add_to_soul(self, content: str) -> Dict[str, Any]:
+        """Append content to SOUL.md."""
+        with self._file_lock(self._path_for("soul")):
+            self._reload_target("soul")
+
+            # Check if content already exists
+            if content in self.soul_content:
+                return self._success_response("soul", "Content already exists in SOUL.md.")
+
+            # Calculate new total
+            new_total = len(self.soul_content) + len(content) + 2  # +2 for newlines
+            if new_total > self.SOUL_CHAR_LIMIT:
+                return {
+                    "success": False,
+                    "error": (
+                        f"SOUL.md at {len(self.soul_content):,}/{self.SOUL_CHAR_LIMIT:,} chars. "
+                        f"Adding this content ({len(content)} chars) would exceed the limit. "
+                        f"Consider replacing or removing existing content first."
+                    ),
+                    "current_length": len(self.soul_content),
+                    "usage": f"{len(self.soul_content):,}/{self.SOUL_CHAR_LIMIT:,}",
+                }
+
+            # Append content
+            self.soul_content = self.soul_content.rstrip() + "\n\n" + content
+            self.save_to_disk("soul")
+
+        return self._success_response("soul", "Content added to SOUL.md.")
+
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
@@ -277,6 +327,10 @@ class MemoryStore:
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        # Handle SOUL.md differently
+        if target == "soul":
+            return self._replace_in_soul(old_text, new_content)
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
@@ -322,11 +376,39 @@ class MemoryStore:
 
         return self._success_response(target, "Entry replaced.")
 
+    def _replace_in_soul(self, old_text: str, new_content: str) -> Dict[str, Any]:
+        """Replace text in SOUL.md."""
+        with self._file_lock(self._path_for("soul")):
+            self._reload_target("soul")
+
+            if old_text not in self.soul_content:
+                return {"success": False, "error": f"Text '{old_text}' not found in SOUL.md."}
+
+            # Check new length
+            new_soul = self.soul_content.replace(old_text, new_content, 1)
+            if len(new_soul) > self.SOUL_CHAR_LIMIT:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Replacement would put SOUL.md at {len(new_soul):,}/{self.SOUL_CHAR_LIMIT:,} chars. "
+                        f"Shorten the new content."
+                    ),
+                }
+
+            self.soul_content = new_soul
+            self.save_to_disk("soul")
+
+        return self._success_response("soul", "Content replaced in SOUL.md.")
+
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
+
+        # Handle SOUL.md differently
+        if target == "soul":
+            return self._remove_from_soul(old_text)
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
@@ -356,6 +438,35 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    def _remove_from_soul(self, old_text: str) -> Dict[str, Any]:
+        """Remove text from SOUL.md."""
+        with self._file_lock(self._path_for("soul")):
+            self._reload_target("soul")
+
+            if old_text not in self.soul_content:
+                return {"success": False, "error": f"Text '{old_text}' not found in SOUL.md."}
+
+            # Remove the text (and surrounding whitespace if it's a standalone section)
+            self.soul_content = self.soul_content.replace(old_text, "", 1)
+            # Clean up extra blank lines
+            self.soul_content = re.sub(r'\n{3,}', '\n\n', self.soul_content)
+            self.save_to_disk("soul")
+
+        return self._success_response("soul", "Content removed from SOUL.md.")
+
+    def read_soul(self) -> Dict[str, Any]:
+        """Read the current SOUL.md content."""
+        with self._file_lock(self._path_for("soul")):
+            self._reload_target("soul")
+        
+        return {
+            "success": True,
+            "target": "soul",
+            "content": self.soul_content,
+            "char_count": len(self.soul_content),
+            "usage": f"{len(self.soul_content):,}/{self.SOUL_CHAR_LIMIT:,} chars",
+        }
+
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
         Return the frozen snapshot for system prompt injection.
@@ -372,7 +483,6 @@ class MemoryStore:
     # -- Internal helpers --
 
     def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
-        entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
@@ -380,10 +490,16 @@ class MemoryStore:
         resp = {
             "success": True,
             "target": target,
-            "entries": entries,
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
-            "entry_count": len(entries),
         }
+        
+        if target == "soul":
+            resp["content_length"] = len(self.soul_content)
+        else:
+            entries = self._entries_for(target)
+            resp["entries"] = entries
+            resp["entry_count"] = len(entries)
+        
         if message:
             resp["message"] = message
         return resp
@@ -403,6 +519,17 @@ class MemoryStore:
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
+        separator = "═" * 46
+        return f"{separator}\n{header}\n{separator}\n{content}"
+
+    def _render_soul_block(self, content: str) -> str:
+        """Render SOUL.md for system prompt."""
+        if not content:
+            return ""
+
+        current = len(content)
+        pct = min(100, int((current / self.SOUL_CHAR_LIMIT) * 100))
+        header = f"HERMES AGENT PERSONA (SOUL.md) [{pct}% — {current:,}/{self.SOUL_CHAR_LIMIT:,} chars]"
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"
 
@@ -427,6 +554,16 @@ class MemoryStore:
         # alone would incorrectly split entries that contain "§" in their content.
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
         return [e for e in entries if e]
+
+    @staticmethod
+    def _read_soul_file(path: Path) -> str:
+        """Read SOUL.md as whole file."""
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except (OSError, IOError):
+            return ""
 
     @staticmethod
     def _write_file(path: Path, entries: List[str]):
@@ -459,6 +596,28 @@ class MemoryStore:
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
+    @staticmethod
+    def _write_soul_file(path: Path, content: str):
+        """Write SOUL.md using atomic temp-file + rename."""
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent), suffix=".tmp", prefix=".soul_"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, str(path))
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except (OSError, IOError) as e:
+            raise RuntimeError(f"Failed to write SOUL.md {path}: {e}")
+
 
 def memory_tool(
     action: str,
@@ -475,8 +634,13 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in ("memory", "user"):
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in ("memory", "user", "soul"):
+        return tool_error(f"Invalid target '{target}'. Use 'memory', 'user', or 'soul'.", success=False)
+
+    # Special handling for SOUL.md read action
+    if target == "soul" and action == "read":
+        result = store.read_soul()
+        return json.dumps(result, ensure_ascii=False)
 
     if action == "add":
         if not content:
@@ -496,7 +660,7 @@ def memory_tool(
         result = store.remove(target, old_text)
 
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read (soul only)", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -521,18 +685,26 @@ MEMORY_SCHEMA = {
         "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
         "- You discover something about the environment (OS, installed tools, project structure)\n"
         "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
-        "- You identify a stable fact that will be useful again in future sessions\n\n"
+        "- You identify a stable fact that will be useful again in future sessions\n"
+        "- You discover a behavior issue or learn a lesson about HOW to interact\n\n"
         "PRIORITY: User preferences and corrections > environment facts > procedural knowledge. "
         "The most valuable memory prevents the user from having to repeat themselves.\n\n"
         "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
-        "TWO TARGETS:\n"
+        "THREE TARGETS:\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n"
+        "- 'soul': your persona and behavior rules -- HOW you think and interact (evolves with usage)\n\n"
+        "SOUL.MD EVOLUTION:\n"
+        "- When you discover a behavior issue, add a rule to SOUL.md\n"
+        "- When you learn an important lesson about interaction, update SOUL.md\n"
+        "- Keep SOUL.md lean -- only core behavioral rules, not verbose\n"
+        "- Use 'add' to append rules, 'replace' to update existing rules, 'remove' to delete\n"
+        "- Use 'read' to check current SOUL.md content\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (delete -- old_text identifies it), read (soul only).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -540,13 +712,13 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform."
+                "enum": ["add", "replace", "remove", "read"],
+                "description": "The action to perform. 'read' is only available for 'soul' target."
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "user", "soul"],
+                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile, 'soul' for persona and behavior rules."
             },
             "content": {
                 "type": "string",
@@ -578,7 +750,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-
