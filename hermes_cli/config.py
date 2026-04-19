@@ -668,6 +668,17 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Internal parts — agent perspective competition system
+    "parts": {
+        "enabled": False,             # Default off
+        "evolve_on_outcome": True,    # Adjust intensities based on outcomes
+    },
+
+    # Soul evolver — SOUL.md evolution proposals at session end
+    "soul_evolver": {
+        "enabled": False,             # Default off — opt-in
+    },
+
     # Observer agent — periodic conversation health check using cheap LLM
     "observer": {
         "enabled": False,             # Default off — opt-in via config
