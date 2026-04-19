@@ -247,15 +247,21 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
+                available = limit - current
                 return {
                     "success": False,
                     "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
+                        f"Memory full. Current: {current}/{limit} chars ({int(current/limit*100)}%). "
+                        f"Available: {available} chars. "
+                        f"New entry: {len(content)} chars — exceeds available by {len(content) - available} chars. "
+                        f"Remove or consolidate existing entries first."
                     ),
                     "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
+                    "entry_sizes": [
+                        {"index": i, "chars": len(e), "preview": e[:60]}
+                        for i, e in enumerate(entries)
+                    ],
+                    "usage": f"{current}/{limit}",
                 }
 
             entries.append(content)
@@ -308,12 +314,25 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
+                current = len(ENTRY_DELIMITER.join(entries))
+                old_len = len(entries[idx])
+                available = limit - current + old_len
                 return {
                     "success": False,
                     "error": (
-                        f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content or remove other entries first."
+                        f"Replacement exceeds limit. "
+                        f"Total: {current}/{limit} chars ({int(current/limit*100)}%). "
+                        f"Entry[{idx}] size: {old_len} chars. "
+                        f"Available for this entry: {available} chars. "
+                        f"New content: {len(new_content)} chars (over by {len(new_content) - available}). "
+                        f"Shorten by {len(new_content) - available} chars, or remove other entries first."
                     ),
+                    "current_entries": entries,
+                    "usage": f"{current}/{limit}",
+                    "entry_sizes": [
+                        {"index": i, "chars": len(e), "preview": e[:60]}
+                        for i, e in enumerate(entries)
+                    ],
                 }
 
             entries[idx] = new_content
@@ -386,6 +405,15 @@ class MemoryStore:
         }
         if message:
             resp["message"] = message
+
+        # Event-driven pressure warning — only emitted when usage exceeds 80%
+        if pct >= 80:
+            resp["warning"] = (
+                f"Memory pressure: {pct}% full ({current}/{limit} chars). "
+                f"Consolidate NOW: call memory(action='read') to inspect entries, "
+                f"then replace/remove stale ones until below 60%."
+            )
+
         return resp
 
     def _render_block(self, target: str, entries: List[str]) -> str:
@@ -495,8 +523,25 @@ def memory_tool(
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
+    elif action == "read":
+        entries = store._entries_for(target)
+        current = store._char_count(target)
+        limit = store._char_limit(target)
+        result = {
+            "success": True,
+            "target": target,
+            "entries": entries,
+            "usage": f"{current}/{limit}",
+            "pct": min(100, int((current / limit) * 100)) if limit > 0 else 0,
+            "entry_count": len(entries),
+            "entry_sizes": [
+                {"index": i, "chars": len(e), "preview": e[:60]}
+                for i, e in enumerate(entries)
+            ],
+        }
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -532,7 +577,7 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (delete -- old_text identifies it), read (inspect current state and entry sizes).\\n\\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -540,7 +585,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "The action to perform."
             },
             "target": {

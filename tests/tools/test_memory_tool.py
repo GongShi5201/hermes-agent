@@ -255,3 +255,118 @@ class TestMemoryToolDispatcher:
     def test_remove_requires_old_text(self, store):
         result = json.loads(memory_tool(action="remove", store=store))
         assert result["success"] is False
+
+    def test_read_via_tool(self, store):
+        store.add("memory", "test entry one")
+        store.add("memory", "test entry two")
+        result = json.loads(memory_tool(action="read", store=store))
+        assert result["success"] is True
+        assert len(result["entries"]) == 2
+        assert result["entry_count"] == 2
+        assert "entry_sizes" in result
+        assert len(result["entry_sizes"]) == 2
+        assert result["entry_sizes"][0]["index"] == 0
+        assert result["entry_sizes"][0]["chars"] == len("test entry one")
+
+    def test_read_empty(self, store):
+        result = json.loads(memory_tool(action="read", store=store))
+        assert result["success"] is True
+        assert result["entries"] == []
+        assert result["entry_count"] == 0
+        assert result["pct"] == 0
+
+    def test_read_user_target(self, store):
+        store.add("user", "Name: Alice")
+        result = json.loads(memory_tool(action="read", target="user", store=store))
+        assert result["success"] is True
+        assert result["target"] == "user"
+        assert "Name: Alice" in result["entries"]
+
+
+# =========================================================================
+# Improved error messages
+# =========================================================================
+
+class TestImprovedAddError:
+    def test_add_exceed_returns_entry_sizes(self, store):
+        store.add("memory", "x" * 490)
+        result = store.add("memory", "this will exceed the limit")
+        assert result["success"] is False
+        assert "entry_sizes" in result
+        assert len(result["entry_sizes"]) == 1
+        assert result["entry_sizes"][0]["chars"] == 490
+
+    def test_add_exceed_returns_available(self, store):
+        store.add("memory", "x" * 490)
+        result = store.add("memory", "this will exceed the limit")
+        assert result["success"] is False
+        assert "Available:" in result["error"]
+        assert "exceeds available by" in result["error"]
+
+
+class TestImprovedReplaceError:
+    def test_replace_exceed_returns_entry_sizes(self, store):
+        store.add("memory", "x" * 490)
+        result = store.replace("memory", "x" * 490, "y" * 510)
+        assert result["success"] is False
+        assert "entry_sizes" in result
+        assert "Entry[0] size: 490" in result["error"]
+        assert "Available for this entry:" in result["error"]
+
+    def test_replace_exceed_available_calculation(self, store):
+        store.add("memory", "old entry")
+        store.add("memory", "x" * 460)
+        # total ~472, limit=500, old_entry ~9 chars
+        # available = 500 - 472 + 9 = 37
+        result = store.replace("memory", "old entry", "a" * 100)
+        assert result["success"] is False
+        assert "Available for this entry:" in result["error"]
+
+
+# =========================================================================
+# Pressure warning (event-driven in tool response)
+# =========================================================================
+
+class TestPressureWarning:
+    def test_no_warning_below_80(self, store):
+        result = store.add("memory", "x" * 100)
+        assert result["success"] is True
+        assert "warning" not in result
+
+    def test_warning_at_80(self, store):
+        # 80% of 500 = 400
+        result = store.add("memory", "x" * 400)
+        assert result["success"] is True
+        assert "warning" in result
+        assert "Memory pressure" in result["warning"]
+
+    def test_warning_above_80(self, store):
+        result = store.add("memory", "x" * 450)
+        assert result["success"] is True
+        assert "warning" in result
+        assert "Consolidate NOW" in result["warning"]
+        assert "memory(action='read')" in result["warning"]
+
+    def test_replace_triggers_warning(self, store):
+        store.add("memory", "x" * 400)
+        # Now at ~400/500 (80%), replace to stay above
+        result = store.replace("memory", "x" * 400, "y" * 420)
+        assert result["success"] is True
+        assert "warning" in result
+
+
+# =========================================================================
+# Schema validation
+# =========================================================================
+
+class TestSchemaUpdated:
+    def test_schema_enum_has_read(self):
+        actions = MEMORY_SCHEMA["parameters"]["properties"]["action"]["enum"]
+        assert "read" in actions
+        assert "add" in actions
+        assert "replace" in actions
+        assert "remove" in actions
+
+    def test_schema_description_mentions_read(self):
+        desc = MEMORY_SCHEMA["description"]
+        assert "read" in desc.lower()
