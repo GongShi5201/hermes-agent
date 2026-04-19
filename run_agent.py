@@ -1383,6 +1383,20 @@ class AIAgent:
         except Exception:
             pass
 
+        # Reflection layer — tool error analysis and auto-suggestions
+        # Output injected as tool message (preserves prefix cache)
+        self._reflection_layer = None
+        try:
+            _refl_cfg = _agent_cfg.get("reflection", {})
+            if _refl_cfg.get("enabled", True):
+                from agent.reflect import ReflectionLayer
+                self._reflection_layer = ReflectionLayer(
+                    max_reflections=_refl_cfg.get("max_reflections", 3),
+                )
+                self._reflection_model = _refl_cfg.get("model") or "xiaomi/mimo-v2-pro"
+        except Exception:
+            pass
+
         # Tool-use enforcement config: "auto" (default — matches hardcoded
         # model list), true (always), false (never), or list of substrings.
         _agent_section = _agent_cfg.get("agent", {})
@@ -8101,6 +8115,28 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            # Reflection: check if tool result needs analysis (prefix-cache safe)
+            if self._reflection_layer and self._reflection_layer._is_error(function_result):
+                try:
+                    from agent.soul_parser import SoulParser
+                    from hermes_constants import get_hermes_home as _gsh
+                    _soul_path = _gsh() / "SOUL.md"
+                    _soul_rules = {"rules": [], "boundaries": []}
+                    if _soul_path.exists():
+                        _sr = SoulParser.parse(_soul_path.read_text(encoding="utf-8"))
+                        _soul_rules = {"rules": _sr.rules, "boundaries": _sr.boundaries}
+                    _suggestion = self._reflection_layer.reflect(
+                        tool_name=name, tool_args=args, tool_result=function_result,
+                        soul_rules=_soul_rules, llm_client=self.client,
+                        model=self._reflection_model,
+                    )
+                    if _suggestion:
+                        _msg = self._reflection_layer.to_tool_message(_suggestion)
+                        if _msg:
+                            messages.append(_msg)
+                except Exception:
+                    pass
+
         # ── Per-turn aggregate budget enforcement ─────────────────────────
         num_tools = len(parsed_calls)
         if num_tools > 0:
@@ -8463,6 +8499,28 @@ class AIAgent:
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
+
+            # Reflection: check if tool result needs analysis (prefix-cache safe)
+            if self._reflection_layer and self._reflection_layer._is_error(function_result):
+                try:
+                    from agent.soul_parser import SoulParser
+                    from hermes_constants import get_hermes_home as _gsh2
+                    _soul_path2 = _gsh2() / "SOUL.md"
+                    _soul_rules2 = {"rules": [], "boundaries": []}
+                    if _soul_path2.exists():
+                        _sr2 = SoulParser.parse(_soul_path2.read_text(encoding="utf-8"))
+                        _soul_rules2 = {"rules": _sr2.rules, "boundaries": _sr2.boundaries}
+                    _suggestion2 = self._reflection_layer.reflect(
+                        tool_name=function_name, tool_args=function_args,
+                        tool_result=function_result, soul_rules=_soul_rules2,
+                        llm_client=self.client, model=self._reflection_model,
+                    )
+                    if _suggestion2:
+                        _msg2 = self._reflection_layer.to_tool_message(_suggestion2)
+                        if _msg2:
+                            messages.append(_msg2)
+                except Exception:
+                    pass
 
             if not self.quiet_mode:
                 if self.verbose_logging:
@@ -8987,7 +9045,11 @@ class AIAgent:
         truncated_response_prefix = ""
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
-        
+
+        # Reset reflection counter for new conversation
+        if self._reflection_layer:
+            self._reflection_layer.reset()
+
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
         # Must be set before any thread-scoped interrupt syncing.
