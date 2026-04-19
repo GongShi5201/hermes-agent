@@ -1397,6 +1397,31 @@ class AIAgent:
         except Exception:
             pass
 
+        # Observer agent — periodic conversation health check (default disabled)
+        self._observer = None
+        self._observer_model = "xiaomi/mimo-v2-pro"
+        try:
+            _obs_cfg = _agent_cfg.get("observer", {})
+            if _obs_cfg.get("enabled", False):
+                from agent.observer import ObserverAgent
+                self._observer = ObserverAgent(
+                    enabled=True,
+                    check_interval=_obs_cfg.get("check_interval", 3),
+                    confidence_threshold=_obs_cfg.get("confidence_threshold", 0.7),
+                )
+                self._observer_model = _obs_cfg.get("model") or "xiaomi/mimo-v2-pro"
+        except Exception:
+            pass
+
+        # Failure learner — tracks capability gaps
+        self._failure_learner = None
+        try:
+            from agent.failure_learner import FailureLearner
+            self._failure_learner = FailureLearner()
+            self._failure_learner.load_existing_gaps()
+        except Exception:
+            pass
+
         # Tool-use enforcement config: "auto" (default — matches hardcoded
         # model list), true (always), false (never), or list of substrings.
         _agent_section = _agent_cfg.get("agent", {})
@@ -9050,6 +9075,10 @@ class AIAgent:
         if self._reflection_layer:
             self._reflection_layer.reset()
 
+        # Reset observer turn counter for new conversation
+        if self._observer:
+            self._observer.reset()
+
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
         # Must be set before any thread-scoped interrupt syncing.
@@ -11296,6 +11325,58 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    # Observer: periodic conversation health check
+                    if self._observer:
+                        self._observer.increment_turn()
+                        # Check last tool results for critical events
+                        _last_tool_result = None
+                        for _m in reversed(messages):
+                            if _m.get("role") == "tool" and _m.get("tool_call_id"):
+                                _last_tool_result = _m.get("content", "")
+                                break
+                        if self._observer.should_observe(tool_result=_last_tool_result):
+                            try:
+                                from agent.soul_parser import SoulParser
+                                from hermes_constants import get_hermes_home as _ghh3
+                                _sp3 = _ghh3() / "SOUL.md"
+                                _sr3 = {"rules": [], "boundaries": []}
+                                if _sp3.exists():
+                                    _parsed3 = SoulParser.parse(_sp3.read_text(encoding="utf-8"))
+                                    _sr3 = {"rules": _parsed3.rules, "boundaries": _parsed3.boundaries}
+                                _obs_result = self._observer.observe(
+                                    recent_messages=messages[-10:],
+                                    soul_rules=_sr3,
+                                    llm_client=self.client,
+                                    model=self._observer_model,
+                                )
+                                if _obs_result:
+                                    _obs_msg = self._observer.to_tool_message(_obs_result)
+                                    if _obs_msg:
+                                        messages.append(_obs_msg)
+                            except Exception:
+                                pass
+
+                    # Failure learner: classify tool errors
+                    if self._failure_learner and assistant_message.tool_calls:
+                        for _tc in assistant_message.tool_calls:
+                            _tc_name = _tc.function.name
+                            # Find the tool result for this call
+                            for _m in reversed(messages):
+                                if _m.get("role") == "tool" and _m.get("tool_call_id") == _tc.id:
+                                    _tc_result = _m.get("content", "")
+                                    if self._failure_learner._is_error_result(_tc_result):
+                                        _cat = self._failure_learner.classify(
+                                            tool_name=_tc_name, tool_args={},
+                                            tool_result=_tc_result,
+                                        )
+                                        if _cat.value == "missing_affordance":
+                                            self._failure_learner.log_gap(
+                                                capability=_tc_name,
+                                                evidence=_tc_result[:200],
+                                                category=_cat,
+                                            )
+                                    break
 
                     # Reset per-turn retry counters after successful tool
                     # execution so a single truncation doesn't poison the

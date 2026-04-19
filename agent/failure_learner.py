@@ -43,6 +43,23 @@ class FailureLearner:
         self.suggest_threshold = suggest_threshold
         self._gap_counts: Counter = Counter()
 
+    @staticmethod
+    def _is_error_result(result: str) -> bool:
+        """Quick check if tool result indicates an error."""
+        if not result:
+            return False
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict):
+                if data.get("success") is False:
+                    return True
+                if "error" in data:
+                    return True
+        except (json.JSONDecodeError, TypeError):
+            pass
+        lower = result.lower()
+        return any(kw in lower for kw in ["error", "failed", "exception", "traceback"])
+
     def classify(
         self,
         tool_name: str,
@@ -50,6 +67,8 @@ class FailureLearner:
         tool_result: str,
     ) -> FailureCategory:
         """Classify a tool failure based on context."""
+        if not self._is_error_result(tool_result):
+            return FailureCategory.TOOL_ERROR  # default even for non-errors
         result_lower = (tool_result or "").lower()
 
         # Missing affordance: tool doesn't exist
