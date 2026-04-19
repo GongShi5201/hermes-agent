@@ -1422,6 +1422,26 @@ class AIAgent:
         except Exception:
             pass
 
+        # Internal parts — perspective competition system
+        self._internal_parts = None
+        try:
+            _parts_cfg = _agent_cfg.get("parts", {})
+            if _parts_cfg.get("enabled", False):
+                from agent.internal_parts import InternalParts
+                self._internal_parts = InternalParts()
+        except Exception:
+            pass
+
+        # Soul evolver — session-end SOUL.md evolution proposals
+        self._soul_evolver = None
+        try:
+            _evolver_cfg = _agent_cfg.get("soul_evolver", {})
+            if _evolver_cfg.get("enabled", False):
+                from agent.soul_evolver import SoulEvolver
+                self._soul_evolver = SoulEvolver()
+        except Exception:
+            pass
+
         # Tool-use enforcement config: "auto" (default — matches hardcoded
         # model list), true (always), false (never), or list of substrings.
         _agent_section = _agent_cfg.get("agent", {})
@@ -9465,6 +9485,37 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
+                    # Internal parts: compute top bid and inject as subtle hint
+                    if self._internal_parts:
+                        try:
+                            _context = {
+                                "task_steps": api_call_count,
+                                "has_error": any(
+                                    "error" in str(m.get("content", "")).lower()
+                                    for m in messages[-4:]
+                                    if m.get("role") == "tool"
+                                ),
+                                "destructive_action": any(
+                                    kw in str(m.get("content", "")).lower()
+                                    for m in messages[-2:]
+                                    for kw in ["delete", "remove", "drop"]
+                                ),
+                                "user_complaint": any(
+                                    kw in str(m.get("content", "")).lower()
+                                    for m in messages[-2:]
+                                    if m.get("role") == "user"
+                                    for kw in ["wrong", "bad", "terrible", "不满意"]
+                                ),
+                            }
+                            _top = self._internal_parts.get_top_bid(_context)
+                            if _top and _top["score"] > 0.15:
+                                _hint = self._internal_parts.to_system_hint(_top)
+                                if _hint and api_messages:
+                                    # Inject as system message at the front
+                                    api_messages.insert(0, {"role": "system", "content": _hint})
+                        except Exception:
+                            pass
+
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(
                             api_kwargs, on_first_delta=_stop_spinner
@@ -11991,6 +12042,48 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # Soul evolver: generate SOUL.md evolution proposals at session end
+        if self._soul_evolver:
+            try:
+                _soul_path = get_hermes_home() / "SOUL.md"
+                if _soul_path.exists():
+                    _current_soul = _soul_path.read_text(encoding="utf-8")
+                    # Collect session errors from failure_learner
+                    _errors = []
+                    if self._failure_learner:
+                        _gaps = self._failure_learner.get_gaps_summary()
+                        for cap, count in _gaps.items():
+                            _errors.append({"tool": cap, "error": f"missing affordance x{count}", "turn": 0})
+                    # Collect observer insights
+                    _insights = getattr(self, '_session_insights', [])
+                    _lessons = self._soul_evolver.extract_lessons(_errors)
+                    for insight in _insights:
+                        self._soul_evolver.record_insight(insight)
+                    _proposal = self._soul_evolver.generate_proposal(_lessons, _current_soul)
+                    if _proposal:
+                        # Save proposal for user to review at next startup
+                        _proposal_path = get_hermes_home() / "soul_evolution_proposal.json"
+                        import json as _json
+                        _proposal_path.write_text(_json.dumps({
+                            "rationale": _proposal.rationale,
+                            "lessons": _proposal.lessons,
+                            "diff": _proposal.diff,
+                            "timestamp": _proposal.timestamp,
+                        }, ensure_ascii=False, indent=2), encoding="utf-8")
+                        logger.info("Soul evolution proposal saved to %s", _proposal_path)
+            except Exception as _evo_err:
+                logger.debug("Soul evolver error: %s", _evo_err)
+
+        # Internal parts: evolve based on session outcome
+        if self._internal_parts:
+            try:
+                if completed:
+                    self._internal_parts.evolve({"executor_win": True})
+                elif interrupted:
+                    pass  # neutral
+            except Exception:
+                pass
 
         return result
 
