@@ -668,6 +668,14 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Reflection layer — tool error analysis and auto-suggestions
+    "reflection": {
+        "enabled": True,              # Enable reflection on tool errors
+        "max_reflections": 3,         # Max reflections per conversation
+        "confidence_threshold": 0.7,  # Min confidence to inject suggestion
+        "model": "",                  # Model for reflection (empty = xiaomi/mimo-v2-pro)
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
