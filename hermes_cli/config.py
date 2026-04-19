@@ -668,6 +668,14 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Observer agent — periodic conversation health check using cheap LLM
+    "observer": {
+        "enabled": False,             # Default off — opt-in via config
+        "check_interval": 3,          # Observe every N turns
+        "confidence_threshold": 0.7,  # Min confidence to inject insight
+        "model": "",                  # Model for observer (empty = xiaomi/mimo-v2-pro)
+    },
+
     # Reflection layer — tool error analysis and auto-suggestions
     "reflection": {
         "enabled": True,              # Enable reflection on tool errors
